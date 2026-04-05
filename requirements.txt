@@ -3,3 +3,9 @@ pandas
 numpy
 statsmodels
 scikit-learn
+matplotlib
+scipy
+gymnasium
+stable-baselines3
+alpaca-py
+python-dotenv
