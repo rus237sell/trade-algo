@@ -9,3 +9,5 @@ gymnasium
 stable-baselines3
 alpaca-py
 python-dotenv
+nolds
+arch
