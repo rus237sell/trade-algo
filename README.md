@@ -1,166 +1,62 @@
-# quant-research
+# trade-algo
 
-An offline quantitative research pipeline combining classical econometrics with machine learning for systematic equity trading. The architecture separates signal generation from signal filtering — a two-model design that mirrors the research process at systematic funds.
-
----
-
-## Research Objective
-
-The central question this project addresses: when a statistically valid mean-reversion signal fires, can a secondary machine learning model determine whether market conditions at that moment are likely to produce a profitable outcome?
-
-The answer to that question is operationalized through a dual-layer architecture: a cointegration-based primary model that generates candidate trades, and a Random Forest meta-labeler that filters and sizes those trades based on contextual market features.
+A systematic equity research pipeline built around pairs trading — find two structurally related stocks (KO/PEP, GS/MS, XOM/CVX), measure when their spread stretches beyond normal, and bet on reversion. A machine learning layer filters signals by estimating the probability a given trade will actually work before sizing into it.
 
 ---
 
-## Architecture Overview
+## What It Does
 
-```
-raw prices
-    |
-    v
-[Cointegration Layer]
-  ADF test + Engle-Granger
-  Rolling OLS hedge ratio
-  Z-score signal generation
-    |
-    v
-primary signal: {-1, 0, +1}
-    |
-    v
-[Meta-Labeling Layer]
-  Feature extraction at signal time
-  Walk-forward Random Forest classifier
-  P(success) estimation
-    |
-    v
-filtered signal: scaled by P(success), zeroed if P < threshold
-    |
-    v
-[Backtesting Engine]
-  Slippage + commission simulation
-  Trade-level P&L extraction
-  Equity curve
-    |
-    v
-performance metrics
-```
+Layer 1 identifies cointegrated pairs and generates z-score signals when spreads diverge. Layer 2 is a Random Forest meta-labeler that filters those signals using market context — volatility levels, VIX, z-score momentum, OU half-life. Position size scales with predicted success probability rather than being binary on/off.
 
 ---
 
-## Layer 1: Cointegration
+## What We Started With
 
-Two assets Y and X are cointegrated if their long-run relationship is stationary, meaning:
+The first version was a naive SMA trader — buy when price drops below the 5-period moving average, sell when it rises above. It worked occasionally in sideways markets and got wrecked in trending ones. No regime awareness, fixed spreads, position limits of 20, no memory of market state.
 
-```
-Y_t = alpha + beta * X_t + epsilon_t
-```
-
-where epsilon_t ~ I(0) (stationary). The spread S_t = Y_t - beta * X_t will revert to its mean after deviations, providing a tradeable signal.
-
-**Pair Selection** applies three filters sequentially:
-
-1. Engle-Granger cointegration test (p < 0.05)
-2. Augmented Dickey-Fuller test on the residual spread (robustness check)
-3. Ornstein-Uhlenbeck half-life filter (half_life < 120 trading days)
-
-The OU half-life is estimated from the discrete-time regression:
-
-```
-delta_S_t = a + b * S_{t-1} + epsilon_t
-half_life = -ln(2) / b
-```
-
-Pairs with slow mean reversion (long half-life) are discarded because they tie up capital for extended periods with poor risk-adjusted returns.
-
-**Time-varying beta** is estimated via rolling 60-day OLS rather than a static formation-period estimate. This allows the hedge ratio to adapt to structural shifts in the relationship between the two assets, reducing the directional leakage that a stale fixed beta would introduce.
-
-**Signal generation** uses rolling z-score thresholds:
-
-- Long spread (+1): z < -2.0 (spread below equilibrium)
-- Short spread (-1): z > +2.0 (spread above equilibrium)
-- Exit: |z| < 0.5
-- Stop-loss: |z| > 3.5 (spread diverging — structural break possible)
+That exposed the core problem: a mean-reversion strategy has no edge in a trending market. It will just keep fading a move that keeps going. Everything after that was solving this problem progressively.
 
 ---
 
-## Layer 2: Meta-Labeling
+## Flaws Found
 
-Meta-labeling (Lopez de Prado, 2018) treats the primary model's signal as a candidate rather than an execution instruction. A secondary model then estimates the probability that this specific candidate trade will be profitable given the current market context.
+**Flaw 1 — The Hurst estimator was lying (3 flaws in 1)**
 
-**Label Construction** simulates each primary trade to completion and assigns:
+The system used classical R/S analysis to compute the Hurst exponent and gated trades behind H < 0.45. Problem: R/S analysis inflates H by +0.05 to +0.10 on any stock with upward drift. Since large-cap US equities generally trend upward over time, the H < 0.45 gate was essentially unreachable — it was blocking 77–87% of trading days. The system thought it was being disciplined; it was just not trading.
 
-- Label 1: trade closed profitably (spread reverted in the direction of the bet)
-- Label 0: trade closed at a loss (spread diverged or hit stop-loss)
+**Flaw 2 — Binary AND gating killed volume**
 
-**Feature Set** at trade entry:
+Stacking hard filters multiplicatively is self-defeating. If H < 0.45 passes 30% of days, and ADX < 25 passes 40% of days, the combined AND gate passes 12%. The observed result was approximately 0.6 trades per year — statistically meaningless. You need a minimum of 30 trades per year per instrument to distinguish signal from noise. At 0.6/year, reaching 30 independent trades takes 50 years of data.
 
-| Feature | Description |
-|---|---|
-| z_at_entry | Z-score magnitude at signal time |
-| spread_volatility | 20-day rolling std of spread returns |
-| z_velocity | First difference of z-score (rate of divergence) |
-| z_acceleration | Second difference of z-score (is divergence accelerating?) |
-| vix_level | CBOE VIX at entry date |
-| vix_percentile | 252-day rolling percentile rank of VIX |
-| ou_half_life | 60-day rolling OU half-life estimate |
+**Flaw 3 — Trending regimes were completely discarded**
 
-**Walk-Forward Validation** ensures no lookahead contamination. At each retraining step T, the model trains only on labeled trades in [0, T) and generates predictions for [T, T + step). This produces a fully out-of-sample probability series across the entire backtest period.
-
-**Position Sizing** scales the primary signal by the predicted probability:
-
-```
-if P(success) < threshold:      position = 0
-if P(success) >= threshold:     position = signal * (P - threshold) / (1 - threshold)
-```
-
-A trade with P = 0.85 at threshold = 0.60 receives 100% of the target allocation. A trade with P = 0.62 receives 8%. This makes high-confidence trades substantially larger than borderline ones.
+Stocks spend roughly 60–80% of time in trending conditions (H > 0.5). The original design filters all of that out and only trades the ranging minority. A mean-reversion strategy running alone is leaving most of the market's time on the table. The diversification math on combining momentum and mean-reversion is well-documented: at a correlation of –0.3 between the two legs, a combined portfolio yields roughly 69% Sharpe improvement over either alone.
 
 ---
 
-## Backtesting Methodology
+## What Was Changed
 
-The engine is fully vectorized using pandas and numpy. All costs are applied on signal changes (entries and exits), not on a per-day basis.
+**`signals/regime_filter.py`** — R/S Hurst replaced with DFA-1 (Detrended Fluctuation Analysis via `nolds`). DFA explicitly fits and removes a linear trend within each non-overlapping box before measuring fluctuation scaling, making it drift-robust by construction. Bias on N=1000 is +0.02 to +0.04 versus R/S at +0.05 to +0.10. The fixed H < 0.45 threshold is replaced with a percentile gate: enter mean-reversion when the current DFA exponent falls in the bottom 30th percentile of its own trailing 2-year distribution. This adapts automatically across different assets and market regimes. Binary AND gate replaced with continuous sigmoid weights — the composite score in [0,1] scales position size proportionally rather than gating it off entirely.
 
-**Transaction cost model:**
-
-```
-round_trip_cost = 2 * (slippage_bps + commission_bps) / 10,000
-```
-
-Default: 5 bps slippage + 2 bps commission per side = 14 bps round-trip.
-
-**P&L calculation** per pair per day:
-
-```
-pnl_t = signal_{t-1} * (log_return_Y_t - beta_{t-1} * log_return_X_t)
-```
-
-The lagged signal and lagged beta prevent any execution-day lookahead.
+**`signals/markov_regime.py`** — New file. 2-state Markov-switching model (Hamilton 1989, implemented via statsmodels) classifies each day as trending (low-vol, positive drift) or ranging (high-vol, choppy). Only filtered marginal probabilities are used — never smoothed probabilities, which incorporate future data. A one-day lag is applied before acting on any estimates. Allocation shifts 70/30 toward whichever regime the model identifies, probability-weighted to avoid cliff-edge allocation changes from noisy estimates near the decision boundary.
 
 ---
 
-## Performance Metrics
+## Backtesting Notes
 
-| Metric | Definition |
-|---|---|
-| Annualized Sharpe | (mean daily return / std daily return) * sqrt(252) |
-| Annualized Sortino | (mean daily return / downside std) * sqrt(252) |
-| Max Drawdown | Max peak-to-trough decline of equity curve |
-| Calmar Ratio | Annualized return / |Max Drawdown| |
-| Win Rate | Fraction of trades with positive net P&L |
-| Profit Factor | Sum of winning trades / |sum of losing trades| |
-| Beta | Cov(strategy, SPY) / Var(SPY) |
+Results are research-grade, not production-grade. Key constraints:
+
+- Universe is drawn from today's stock list — survivorship bias overstates pair stability pre-2024
+- Cointegration relationships break during structural shocks (2020, 2022); rolling beta and half-life filter partially mitigate this
+- ML meta-labeler requires 80+ labeled trades before training; pairs that trade infrequently run on unfiltered primary signals for extended periods
+- Flat-BPS slippage model understates real market impact at larger capital allocations
 
 ---
 
-## Research Notes
+## Improvements
 
-This is a research prototype, not a production system. Several limitations apply:
-
-**Survivorship bias.** The universe is drawn from today's stock list. Any company that was delisted or went bankrupt between 2010 and 2024 is absent, which overstates historical pair stability. A production system would require a point-in-time universe database.
-
-**Regime dependence.** Cointegration relationships are not permanent. The 2020 COVID shock and 2022 rate cycle disrupted many structural relationships that appeared stable over the preceding decade. The rolling beta and half-life filter partially mitigate this, but structural breaks can invalidate a pair rapidly.
-
-**ML sample size.** The meta-labeling model requires a minimum of 80 labeled trades before training begins. For pairs that trade infrequently, this means a substantial portion of the backtest period runs on unfiltered primary signals.
-
-**Execution model.** The flat-BPS slippage model is a simplification. Actual market impact scales with trade size and liquidity conditions. For larger capital allocations, a more sophisticated market impact model (e.g., square-root law) would be necessary.
+- Factor-residualize returns before computing DFA — remove Fama-French common factor exposure first, then run DFA on the idiosyncratic residual. This is the cleanest way to isolate genuine mean-reversion signal from market-wide drift
+- Add variance ratio test (via `arch`) as a secondary validation pass on the DFA signal
+- Pool trade samples across all 8 instruments — at 5 trades/year/stock, 8 instruments yields 40 annual trades, clearing the minimum threshold for CPCV validation
+- Reduce CPCV to N=4 folds with embargo = max(holding period, DFA lookback window)
+- Replace flat-BPS slippage with a square-root market impact model for capital allocations above ~$2M
