@@ -1,0 +1,24 @@
+# data cache
+*.csv
+*.parquet
+data/cache/
+
+# python artifacts
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# environment
+venv/
+.venv/
+env/
+
+# editor
+.vscode/
+.idea/
+*.DS_Store
+
+# output files
+outputs/
+*.log
