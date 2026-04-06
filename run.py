@@ -14,6 +14,7 @@ from strategies.sector_pairs import scan_sectors_from_window, get_all_sector_sym
 from research.spread_model import build_pair_model
 from research.meta_labeler import MetaLabeler, label_trades, build_features
 from research.pairs_finder import rolling_adf_health
+from signals.regime_filter import rolling_dfa, composite_score, threshold_gate, compute_adx_from_close
 from backtest.engine import run_backtest
 from backtest.metrics import summarize
 
@@ -100,11 +101,30 @@ def main():
             continue
 
         model = build_pair_model(prices, y_sym, x_sym)
+
+        # run DFA on the spread (not raw stock prices) — spread is what mean-reverts
+        spread_returns = model["spread"].pct_change().dropna()
+        # reconstruct a price-like series so rolling_dfa can compute log-returns
+        spread_price = (1 + spread_returns).cumprod() * 100
+
+        dfa_series = rolling_dfa(spread_price, window=config.DFA_WINDOW, step=config.DFA_STEP)
+        adx_series = compute_adx_from_close(prices[y_sym])
+        score      = composite_score(
+            dfa_series.reindex(prices.index).ffill(),
+            adx_series.reindex(prices.index).ffill(),
+            model["zscore"].fillna(0),
+        )
+
+        # apply threshold gate — avoids near-zero positions that bleed transaction costs
+        gated_signals = threshold_gate(model["signals"], score)
+        model["signals"] = gated_signals
+
         pair_models[pair_id] = model
         pair_definitions.append((y_sym, x_sym))
 
-        n_signals = (model["signals"] != 0).sum()
-        print(f"    {y_sym}/{x_sym}: {n_signals} primary signals generated")
+        n_raw    = (model["signals"] != 0).sum()
+        n_gated  = (gated_signals != 0).sum()
+        print(f"    {y_sym}/{x_sym}: {n_raw} raw → {n_gated} gated signals")
 
     # phase 4: meta-labeling — ML overlay on primary signals
     print("\n[4/5] running meta-labeling (walk-forward)...")

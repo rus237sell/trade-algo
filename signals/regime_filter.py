@@ -24,6 +24,7 @@ Primary usage:
 
 import numpy as np
 import pandas as pd
+import config
 
 try:
     import nolds
@@ -221,6 +222,35 @@ def composite_score(
     w_entry = np.clip(kalman_z.abs() / 2.0, 0, 1)
 
     return (w_dfa * w_adx * w_entry).fillna(0.0)
+
+
+def threshold_gate(signal, composite_score, min_threshold=None, full_threshold=None):
+    """
+    Three-zone gate — replaces raw multiplication of signal by DFA score.
+
+    Below min_threshold: no trade (signal = 0, transaction cost avoided)
+    Between thresholds:  signal scaled proportionally by score
+    Above full_threshold: full signal passed unchanged
+
+    Works on scalars or aligned pandas Series.
+    """
+    if min_threshold is None:
+        min_threshold = config.DFA_MIN_THRESHOLD
+    if full_threshold is None:
+        full_threshold = config.DFA_FULL_THRESHOLD
+
+    if isinstance(composite_score, pd.Series):
+        cs  = composite_score.values
+        sig = signal.values if isinstance(signal, pd.Series) else np.full(len(cs), float(signal))
+        out = np.where(cs < min_threshold, 0.0,
+              np.where(cs < full_threshold, sig * cs, sig))
+        return pd.Series(out, index=composite_score.index)
+
+    if composite_score < min_threshold:
+        return 0.0
+    if composite_score < full_threshold:
+        return float(signal) * composite_score
+    return signal
 
 
 # ---- Legacy Binary Gate (retained for benchmark comparison) ------------------
