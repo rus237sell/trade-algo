@@ -16,6 +16,7 @@ from research.meta_labeler import MetaLabeler, label_trades, build_features
 from research.pairs_finder import rolling_adf_health
 from signals.regime_filter import rolling_dfa, composite_score, threshold_gate, compute_adx_from_close, variance_ratio_filter
 from signals.markov_regime import rolling_regime_fit, regime_allocation
+from strategies.momentum import MomentumStrategy
 from backtest.engine import run_backtest
 from backtest.metrics import summarize
 
@@ -241,17 +242,70 @@ def main():
     else:
         print(f"    below {config.ML_MIN_TRAIN_SAMPLES} minimum — using unfiltered signals")
 
-    # phase 5: backtest
-    print("\n[5/5] running vectorized backtest...")
+    # phase 5: momentum strategy — runs when Markov indicates trending regime
+    print("\n[5/6] running momentum strategy...")
+
+    mom_daily_returns = None
+    mom_weight_avg    = 0.0
+
+    if pair_models:
+        portfolio_spread_returns_check = pd.DataFrame({
+            pid: pair_models[pid]["spread"].pct_change()
+            for pid in pair_models
+        }).dropna()
+
+        if len(portfolio_spread_returns_check) >= config.MARKOV_WINDOW:
+            equal_weighted_check = portfolio_spread_returns_check.mean(axis=1)
+            try:
+                rp2 = rolling_regime_fit(
+                    equal_weighted_check,
+                    estimation_days = config.MARKOV_WINDOW,
+                    refit_every     = config.MARKOV_REFIT_INTERVAL,
+                    prob_threshold  = config.MARKOV_SWITCH_THRESHOLD,
+                )
+                alloc2 = regime_allocation(rp2, mom_weight_trending=config.MARKOV_TRENDING_MOM_WEIGHT)
+                mom_weight_series = alloc2["momentum_weight"].reindex(prices.index).ffill().fillna(0.0)
+                mom_weight_avg = mom_weight_series.mean()
+            except Exception:
+                mom_weight_series = pd.Series(0.0, index=prices.index)
+        else:
+            mom_weight_series = pd.Series(0.0, index=prices.index)
+    else:
+        mom_weight_series = pd.Series(0.0, index=prices.index)
+
+    if mom_weight_avg > 0.05:
+        try:
+            mom = MomentumStrategy()
+            mom_positions    = mom.generate_signals()
+            mom_prices       = mom._fetch_etf_prices()
+            mom_raw_returns  = mom.compute_returns(mom_positions, mom_prices)
+            # weight by Markov momentum allocation
+            mom_daily_returns = mom_raw_returns.reindex(prices.index).fillna(0) * mom_weight_series
+            print(f"    momentum active | avg allocation: {mom_weight_avg:.2f}")
+        except Exception as e:
+            print(f"    momentum strategy failed: {e}")
+    else:
+        print(f"    momentum weight < 5% — skipped")
+
+    # phase 6: backtest
+    print("\n[6/6] running vectorized backtest...")
 
     market_returns = np.log(market / market.shift(1)).dropna()
 
-    daily_returns, equity_curve, trade_pnl = run_backtest(
+    mr_daily_returns, equity_curve, trade_pnl = run_backtest(
         prices           = prices,
         signals          = signals_matrix,
         betas            = betas_dict,
         pair_definitions = pair_definitions,
     )
+
+    # combine MR returns with momentum returns
+    if mom_daily_returns is not None:
+        daily_returns = mr_daily_returns.add(mom_daily_returns.reindex(mr_daily_returns.index).fillna(0), fill_value=0)
+    else:
+        daily_returns = mr_daily_returns
+
+    equity_curve = (1 + daily_returns).cumprod() * config.INITIAL_CAPITAL
 
     perf = summarize(
         returns        = daily_returns.dropna(),
