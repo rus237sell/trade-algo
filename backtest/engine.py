@@ -3,15 +3,38 @@ import numpy as np
 import config
 
 
+def market_impact_bps(
+    trade_dollars:  float,
+    adv_dollars:    float,
+    daily_vol:      float,
+    eta:            float = None,
+) -> float:
+    """
+    Almgren-Chriss square-root market impact model.
+
+    Replaces flat BPS slippage. Impact scales with sqrt(participation rate),
+    which better reflects the reality that large trades move prices more than small ones.
+
+    impact = eta * daily_vol * sqrt(|trade_dollars| / adv_dollars) * 10000
+
+    Floored at MIN_SLIPPAGE_BPS to account for fixed exchange/brokerage costs.
+    Orders are assumed to be capped at MAX_PARTICIPATION_RATE of ADV.
+    """
+    if eta is None:
+        eta = config.IMPACT_ETA
+
+    if adv_dollars <= 0 or daily_vol <= 0:
+        return config.MIN_SLIPPAGE_BPS
+
+    participation_rate = min(abs(trade_dollars) / adv_dollars, config.MAX_PARTICIPATION_RATE)
+    impact = eta * daily_vol * (participation_rate ** 0.5) * 10_000
+    return max(impact, config.MIN_SLIPPAGE_BPS)
+
+
 def compute_cost_per_trade(price: float) -> float:
     """
-    Round-trip cost per dollar traded.
-
-    Slippage + commission applied on each leg (entry and exit).
-    Both are one-way costs, so we multiply by 2 for round-trip.
-
-    Slippage models the market impact of the order hitting the book.
-    Commission models exchange and brokerage fees.
+    Legacy flat-BPS round-trip cost. Kept for reference.
+    run_backtest uses market_impact_bps when USE_SQRT_IMPACT = True.
     """
     one_way_cost = (config.SLIPPAGE_BPS + config.COMMISSION_BPS) / 10_000
     return 2 * one_way_cost
@@ -71,10 +94,22 @@ def run_backtest(
         # transaction cost: applied on every signal change (entry or exit)
         signal_change = (sig != sig.shift(1)).astype(float)
 
-        # cost is proportional to the mid-price — approximate with a flat BPS model
-        avg_price = (prices[y_sym] + beta * prices[x_sym]) / 2
-        cost_pct  = (config.SLIPPAGE_BPS + config.COMMISSION_BPS) / 10_000
-        daily_cost = signal_change * cost_pct * 2  # *2 for round-trip on both legs
+        # 20-day rolling average daily volume (dollar) and realized volatility for impact model
+        y_vol   = np.log(prices[y_sym] / prices[y_sym].shift(1)).rolling(20).std().fillna(0.02)
+        adv_y   = prices[y_sym].rolling(20).mean().fillna(prices[y_sym]) * 1e6  # approximate ADV
+        adv_x   = prices[x_sym].rolling(20).mean().fillna(prices[x_sym]) * 1e6
+
+        if config.USE_SQRT_IMPACT:
+            # Almgren-Chriss impact: per-leg cost scaled by sqrt(participation)
+            trade_size   = capital_per_pair * sig.abs().replace(0, np.nan)
+            impact_y_bps = trade_size.apply(
+                lambda t: market_impact_bps(t, adv_y.mean(), y_vol.mean())
+                if not np.isnan(t) else 0.0
+            )
+            daily_cost = signal_change * (impact_y_bps / 10_000) * 2
+        else:
+            cost_pct   = (config.SLIPPAGE_BPS + config.COMMISSION_BPS) / 10_000
+            daily_cost = signal_change * cost_pct * 2
 
         net_pnl = gross_pnl - daily_cost
 
