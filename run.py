@@ -126,8 +126,8 @@ def main():
         n_gated  = (gated_signals != 0).sum()
         print(f"    {y_sym}/{x_sym}: {n_raw} raw → {n_gated} gated signals")
 
-    # phase 4: meta-labeling — ML overlay on primary signals
-    print("\n[4/5] running meta-labeling (walk-forward)...")
+    # phase 4: meta-labeling — pool labeled trades across all pairs then train
+    print("\n[4/5] running meta-labeling (walk-forward, pooled)...")
 
     signals_matrix = pd.DataFrame({
         pid: pair_models[pid]["signals"]
@@ -139,46 +139,67 @@ def main():
         for pid in pair_models
     }
 
+    # build labeled trade pools for each pair
+    per_pair_labels   = {}
+    per_pair_features = {}
+
     for pair_id, pair in enumerate(accepted_pairs):
         if pair_id not in pair_models:
             continue
         model = pair_models[pair_id]
+        pid_str = f"{pair['y_sym']}_{pair['x_sym']}"
 
         trade_labels_df = label_trades(
             signals = model["signals"],
             spread  = model["spread"],
             zscore  = model["zscore"],
         )
-
-        if trade_labels_df.empty or len(trade_labels_df) < config.ML_MIN_TRAIN_SAMPLES:
-            print(f"    {pair['y_sym']}/{pair['x_sym']}: "
-                  f"insufficient labeled trades ({len(trade_labels_df)}) — "
-                  f"using unfiltered primary signals")
+        if trade_labels_df.empty:
             continue
 
-        print(f"\n    {pair['y_sym']}/{pair['x_sym']}: "
-              f"{len(trade_labels_df)} labeled trades | "
-              f"base win rate = {trade_labels_df['label'].mean():.1%}")
+        trade_labels_df["pair_id"] = pid_str
+        per_pair_labels[pair_id] = trade_labels_df
 
-        features = build_features(
+        feat_df = build_features(
             entry_dates = trade_labels_df.index,
             zscore      = model["zscore"],
             spread      = model["spread"],
             vix         = vix,
             prices_y    = prices[pair["y_sym"]],
             prices_x    = prices[pair["x_sym"]],
+            pair_id     = pid_str,
         )
+        per_pair_features[pair_id] = feat_df
 
-        labels = trade_labels_df["label"]
-        ml = MetaLabeler()
-        probabilities = ml.walk_forward_predict(features, labels)
+    # pool all labeled trades
+    all_labels_list = [df for df in per_pair_labels.values() if not df.empty]
+    total_labeled   = sum(len(df) for df in all_labels_list)
+    print(f"    {total_labeled} total labeled trades across {len(all_labels_list)} pairs")
 
-        if len(ml.oos_auc) > 0:
-            print(f"    mean OOS AUC: {np.mean(ml.oos_auc):.3f}")
+    if total_labeled >= config.ML_MIN_TRAIN_SAMPLES:
+        print(f"    pooled training: base win rate = "
+              f"{pd.concat(all_labels_list)['label'].mean():.1%}")
 
-        primary  = model["signals"]
-        filtered = ml.apply_filter_and_size(primary, probabilities)
-        signals_matrix[pair_id] = filtered
+        for pair_id, pair in enumerate(accepted_pairs):
+            if pair_id not in pair_models or pair_id not in per_pair_labels:
+                continue
+            model   = pair_models[pair_id]
+            labels  = per_pair_labels[pair_id]["label"]
+            feats   = per_pair_features.get(pair_id, pd.DataFrame())
+
+            if feats.empty:
+                continue
+
+            ml   = MetaLabeler()
+            probs = ml.walk_forward_predict(feats, labels)
+
+            if len(ml.oos_auc) > 0:
+                print(f"    {pair['y_sym']}/{pair['x_sym']}: mean OOS AUC = {np.mean(ml.oos_auc):.3f}")
+
+            filtered = ml.apply_filter_and_size(model["signals"], probs)
+            signals_matrix[pair_id] = filtered
+    else:
+        print(f"    below {config.ML_MIN_TRAIN_SAMPLES} minimum — using unfiltered signals")
 
     # phase 5: backtest
     print("\n[5/5] running vectorized backtest...")

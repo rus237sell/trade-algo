@@ -87,7 +87,8 @@ def build_features(
     vix:         pd.Series,
     prices_y:    pd.Series,
     prices_x:    pd.Series,
-    vol_window:  int = 20
+    vol_window:  int = 20,
+    pair_id:     str = None,
 ) -> pd.DataFrame:
     """
     Constructs the feature vector at each trade entry date.
@@ -159,6 +160,14 @@ def build_features(
 
     feat_df = pd.DataFrame(features).T
     feat_df.index = pd.to_datetime(feat_df.index)
+
+    # one-hot encode pair_id so the model generalizes across pairs
+    # while retaining pair-specific information
+    if pair_id is not None:
+        feat_df["pair_id"] = pair_id
+        pair_dummies = pd.get_dummies(feat_df["pair_id"], prefix="pair")
+        feat_df = pd.concat([feat_df.drop(columns=["pair_id"]), pair_dummies], axis=1)
+
     return feat_df
 
 
