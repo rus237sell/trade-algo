@@ -91,6 +91,21 @@ def compute_half_life(spread: pd.Series) -> float:
     return half_life
 
 
+def rolling_adf_health(spread: pd.Series, window: int = None) -> float:
+    """
+    ADF p-value on the most recent window of the spread.
+    If p > config.ADF_RETIRE_THRESHOLD the pair is flagged for retirement.
+    Runs daily as a lightweight check between quarterly full rescans.
+    """
+    if window is None:
+        window = config.ADF_HEALTH_WINDOW
+    recent = spread.dropna().iloc[-window:]
+    if len(recent) < 30:
+        return 1.0
+    _, p_value = adf_test(recent)
+    return p_value
+
+
 def find_cointegrated_pairs(
     prices: pd.DataFrame,
     formation_start: int,

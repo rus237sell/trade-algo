@@ -13,6 +13,7 @@ from data.loader import fetch_prices, fetch_market_data, fetch_vix
 from strategies.sector_pairs import scan_sectors_from_window, get_all_sector_symbols, SECTOR_UNIVERSE
 from research.spread_model import build_pair_model
 from research.meta_labeler import MetaLabeler, label_trades, build_features
+from research.pairs_finder import rolling_adf_health
 from backtest.engine import run_backtest
 from backtest.metrics import summarize
 
@@ -42,11 +43,39 @@ def main():
 
     print(f"    {len(prices)} trading days | {len(prices.columns)} symbols")
 
-    # phase 2: sector-constrained pair selection on the formation window
-    print("\n[2/5] scanning for cointegrated sector pairs...")
+    # phase 2: rolling sector pair selection — rescan every RESCAN_INTERVAL days
+    print("\n[2/5] scanning for cointegrated sector pairs (rolling)...")
 
-    formation_end = min(config.FORMATION_WINDOW, len(prices))
-    accepted_pairs = scan_sectors_from_window(prices, 0, formation_end)
+    n_days = len(prices)
+    rescan_points = list(range(config.FORMATION_WINDOW, n_days, config.RESCAN_INTERVAL))
+    if not rescan_points:
+        rescan_points = [min(config.FORMATION_WINDOW, n_days - 1)]
+
+    # track pairs by key: "Y_X" -> pair dict (last seen definition wins)
+    active_pair_registry = {}
+
+    for rescan_end in rescan_points:
+        rescan_start = max(0, rescan_end - config.FORMATION_WINDOW)
+        found = scan_sectors_from_window(prices, rescan_start, rescan_end)
+
+        # retire pairs whose ADF health has drifted
+        for key in list(active_pair_registry.keys()):
+            pair = active_pair_registry[key]
+            y = pair["y_sym"]
+            x = pair["x_sym"]
+            if y not in prices.columns or x not in prices.columns:
+                del active_pair_registry[key]
+                continue
+            spread = prices[y].iloc[:rescan_end] - pair["beta"] * prices[x].iloc[:rescan_end]
+            if rolling_adf_health(spread) > config.ADF_RETIRE_THRESHOLD:
+                del active_pair_registry[key]
+
+        # add newly found pairs
+        for pair in found:
+            key = f"{pair['y_sym']}_{pair['x_sym']}"
+            active_pair_registry[key] = pair
+
+    accepted_pairs = list(active_pair_registry.values())
 
     if not accepted_pairs:
         print("    no cointegrated sector pairs found.")
