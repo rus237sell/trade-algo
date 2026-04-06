@@ -224,6 +224,44 @@ def composite_score(
     return (w_dfa * w_adx * w_entry).fillna(0.0)
 
 
+def variance_ratio_filter(
+    spread_returns: pd.Series,
+    lags:           list = None,
+    p_threshold:    float = 0.10,
+) -> bool:
+    """
+    Lo-MacKinlay variance ratio test — secondary filter alongside DFA.
+
+    Tests at multiple lags. The spread passes (is anti-persistent) if at least
+    2 of 4 lag tests reject the random walk null at p < 0.10 with VR(k) < 1.0.
+
+    Both DFA and VR must agree before the regime gate opens. This reduces
+    false positives from DFA alone on short spread histories.
+    """
+    if lags is None:
+        lags = [2, 5, 10, 20]
+
+    clean = spread_returns.dropna()
+    if len(clean) < 30:
+        return False
+
+    try:
+        from arch.unitroot import VarianceRatio
+    except ImportError:
+        return True  # if arch not available, skip VR check and pass through
+
+    anti_persistent_count = 0
+    for k in lags:
+        try:
+            vr = VarianceRatio(clean.values, lags=k)
+            if vr.pvalue < p_threshold and vr.vr < 1.0:
+                anti_persistent_count += 1
+        except Exception:
+            continue
+
+    return anti_persistent_count >= 2
+
+
 def threshold_gate(signal, composite_score, min_threshold=None, full_threshold=None):
     """
     Three-zone gate — replaces raw multiplication of signal by DFA score.

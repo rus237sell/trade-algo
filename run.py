@@ -14,7 +14,7 @@ from strategies.sector_pairs import scan_sectors_from_window, get_all_sector_sym
 from research.spread_model import build_pair_model
 from research.meta_labeler import MetaLabeler, label_trades, build_features
 from research.pairs_finder import rolling_adf_health
-from signals.regime_filter import rolling_dfa, composite_score, threshold_gate, compute_adx_from_close
+from signals.regime_filter import rolling_dfa, composite_score, threshold_gate, compute_adx_from_close, variance_ratio_filter
 from signals.markov_regime import rolling_regime_fit, regime_allocation
 from backtest.engine import run_backtest
 from backtest.metrics import summarize
@@ -115,6 +115,11 @@ def main():
             adx_series.reindex(prices.index).ffill(),
             model["zscore"].fillna(0),
         )
+
+        # variance ratio secondary check — halve score when VR disagrees with DFA
+        vr_passes = variance_ratio_filter(spread_returns)
+        if not vr_passes:
+            score = score * 0.5
 
         # apply threshold gate — avoids near-zero positions that bleed transaction costs
         gated_signals = threshold_gate(model["signals"], score)
