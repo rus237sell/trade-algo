@@ -39,40 +39,27 @@ import config
 from research.pairs_finder import engle_granger_coint, adf_test, compute_half_life
 
 
-# GICS sector groupings with representative liquid names
-# In a production system this would be pulled from a data vendor (Bloomberg, CRSP)
+# sector universe — economically related pairs only, residualized against sector ETF
 SECTOR_UNIVERSE = {
-    "Energy": {
-        "tickers": ["XOM", "CVX", "COP", "EOG", "SLB", "MPC", "PSX", "VLO"],
-        "etf":     "XLE",
+    "Consumer_Staples": {
+        "stocks": ["KO", "PEP", "WMT", "TGT", "MCD", "YUM"],
+        "etf":    "XLP",
     },
     "Financials": {
-        "tickers": ["JPM", "BAC", "WFC", "GS", "MS", "C", "BK", "STT"],
-        "etf":     "XLF",
+        "stocks": ["GS", "MS", "JPM"],
+        "etf":    "XLF",
+    },
+    "Energy": {
+        "stocks": ["XOM", "CVX"],
+        "etf":    "XLE",
     },
     "Technology": {
-        "tickers": ["MSFT", "AAPL", "NVDA", "ORCL", "IBM", "TXN", "QCOM", "AMAT"],
-        "etf":     "XLK",
-    },
-    "Consumer_Staples": {
-        "tickers": ["KO", "PEP", "WMT", "COST", "PG", "CL", "KMB", "GIS"],
-        "etf":     "XLP",
+        "stocks": ["MSFT", "AAPL"],
+        "etf":    "XLK",
     },
     "Consumer_Discretionary": {
-        "tickers": ["MCD", "YUM", "NKE", "SBUX", "TGT", "HD", "LOW", "AMZN"],
-        "etf":     "XLY",
-    },
-    "Healthcare": {
-        "tickers": ["JNJ", "UNH", "PFE", "MRK", "ABT", "TMO", "DHR", "MDT"],
-        "etf":     "XLV",
-    },
-    "Industrials": {
-        "tickers": ["GE", "HON", "UPS", "FDX", "CAT", "DE", "RTX", "BA"],
-        "etf":     "XLI",
-    },
-    "Utilities": {
-        "tickers": ["NEE", "DUK", "SO", "D", "AEP", "EXC", "SRE", "PCG"],
-        "etf":     "XLU",
+        "stocks": ["HD", "LOW"],
+        "etf":    "XLY",
     },
 }
 
@@ -83,7 +70,7 @@ def fetch_sector_data(sector: str, start: str, end: str) -> tuple[pd.DataFrame, 
     Returns (prices_df, etf_series).
     """
     info      = SECTOR_UNIVERSE[sector]
-    tickers   = info["tickers"] + [info["etf"]]
+    tickers   = info["stocks"] + [info["etf"]]
     etf_sym   = info["etf"]
 
     raw       = yf.download(tickers, start=start, end=end, auto_adjust=True, progress=False)
@@ -218,7 +205,7 @@ def find_sector_pairs(
             model   = OLS(aligned.iloc[:, 0].values, x_const).fit()
             beta    = model.params[1]
 
-            if beta <= 0:
+            if not (config.BETA_MIN <= beta <= config.BETA_MAX):
                 continue
 
             spread = aligned.iloc[:, 0] - beta * aligned.iloc[:, 1]
@@ -228,7 +215,7 @@ def find_sector_pairs(
                 continue
 
             half_life = compute_half_life(spread)
-            if half_life > config.MAX_HALF_LIFE_DAYS or half_life <= 1:
+            if half_life > config.HALFLIFE_MAX or half_life < config.HALFLIFE_MIN:
                 continue
 
             accepted.append({
@@ -244,6 +231,78 @@ def find_sector_pairs(
 
     print(f"    {len(accepted)} pairs accepted from {sector}")
     return accepted
+
+
+def get_all_sector_symbols() -> list[str]:
+    # return deduplicated list of all stock symbols across all sectors
+    symbols = []
+    for info in SECTOR_UNIVERSE.values():
+        symbols.extend(info["stocks"])
+    return list(dict.fromkeys(symbols))
+
+
+def scan_sectors_from_window(
+    all_prices:  pd.DataFrame,
+    window_start: int,
+    window_end:   int,
+    n_clusters:   int = 3,
+    coint_threshold: float = None,
+) -> list[dict]:
+    # run sector pair selection on a slice of pre-downloaded prices (no download)
+    if coint_threshold is None:
+        coint_threshold = config.COINTEGRATION_PVALUE
+    all_pairs = []
+    for sector, info in SECTOR_UNIVERSE.items():
+        stocks = [s for s in info["stocks"] if s in all_prices.columns]
+        etf    = info["etf"]
+        if etf not in all_prices.columns or len(stocks) < 2:
+            continue
+        sector_prices = all_prices[stocks].iloc[window_start:window_end]
+        etf_series    = all_prices[etf].iloc[window_start:window_end]
+        if len(sector_prices) < 60:
+            continue
+        try:
+            residuals = residualize_against_sector(sector_prices, etf_series)
+            clusters  = cluster_within_sector(residuals, n_clusters)
+        except Exception:
+            clusters  = {0: stocks}
+        for cluster_id, cluster_syms in clusters.items():
+            if len(cluster_syms) < 2:
+                continue
+            for y_sym, x_sym in itertools.combinations(cluster_syms, 2):
+                if y_sym not in sector_prices or x_sym not in sector_prices:
+                    continue
+                y = sector_prices[y_sym].dropna()
+                x = sector_prices[x_sym].dropna()
+                aligned = pd.concat([y, x], axis=1).dropna()
+                if len(aligned) < 60:
+                    continue
+                is_coint, coint_p = engle_granger_coint(aligned.iloc[:, 0], aligned.iloc[:, 1], coint_threshold)
+                if not is_coint:
+                    continue
+                x_const = add_constant(aligned.iloc[:, 1].values)
+                model   = OLS(aligned.iloc[:, 0].values, x_const).fit()
+                beta    = model.params[1]
+                if not (config.BETA_MIN <= beta <= config.BETA_MAX):
+                    continue
+                spread = aligned.iloc[:, 0] - beta * aligned.iloc[:, 1]
+                is_stat, adf_p = adf_test(spread)
+                if not is_stat:
+                    continue
+                half_life = compute_half_life(spread)
+                if half_life > config.HALFLIFE_MAX or half_life < config.HALFLIFE_MIN:
+                    continue
+                all_pairs.append({
+                    "sector":       sector,
+                    "cluster":      cluster_id,
+                    "y_sym":        y_sym,
+                    "x_sym":        x_sym,
+                    "beta":         round(beta, 4),
+                    "half_life":    round(half_life, 1),
+                    "coint_pvalue": round(coint_p, 4),
+                    "adf_pvalue":   round(adf_p, 4),
+                })
+    return all_pairs
 
 
 def scan_all_sectors(

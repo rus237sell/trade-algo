@@ -68,3 +68,51 @@ MARKOV_REFIT_DAYS      = 21     # refit monthly
 MARKOV_PROB_THRESHOLD  = 0.70   # probability to act on regime shift (reduce whipsaw)
 MOM_WEIGHT_TRENDING    = 0.70   # momentum allocation in trending regime
 MR_WEIGHT_TRENDING     = 0.30   # mean-reversion allocation in trending regime
+
+# sector pair selection (task 2)
+USE_SECTOR_PAIRS             = True
+SECTOR_RESIDUALIZE           = True
+SECTOR_RESIDUALIZE_WINDOW    = 60
+BETA_MIN                     = 0.3
+BETA_MAX                     = 3.0
+HALFLIFE_MIN                 = 3
+HALFLIFE_MAX                 = 42
+
+# rolling pair health (task 3)
+FORMATION_WINDOW             = 252
+RESCAN_INTERVAL              = 63
+ADF_RETIRE_THRESHOLD         = 0.10
+ADF_HEALTH_WINDOW            = 126
+
+# regime filter gating (task 4)
+DFA_MIN_THRESHOLD            = 0.15
+DFA_FULL_THRESHOLD           = 0.50
+DFA_PERCENTILE               = 0.30
+
+# ML pooling (task 5)
+ML_POOL_ACROSS_PAIRS         = True
+ML_RETRAIN_INTERVAL          = 63
+
+# Markov allocation (task 6)
+MARKOV_WINDOW                = 504
+MARKOV_REFIT_INTERVAL        = 21
+MARKOV_SWITCH_THRESHOLD      = 0.70
+MARKOV_TRENDING_MR_WEIGHT    = 0.30
+MARKOV_TRENDING_MOM_WEIGHT   = 0.70
+MARKOV_RANGING_MR_WEIGHT     = 0.70
+MARKOV_RANGING_MOM_WEIGHT    = 0.30
+
+# momentum strategy (task 8)
+MOMENTUM_LOOKBACK            = 252
+MOMENTUM_SKIP                = 21
+MOMENTUM_LONG_N              = 2
+MOMENTUM_SHORT_N             = 2
+MOMENTUM_TARGET_VOL          = 0.10
+MOMENTUM_REBALANCE_INTERVAL  = 21
+MOMENTUM_ETFS                = ['XLP', 'XLF', 'XLE', 'XLK', 'XLY']
+
+# almgren-chriss slippage (task 10)
+USE_SQRT_IMPACT              = True
+IMPACT_ETA                   = 0.75
+MAX_PARTICIPATION_RATE       = 0.05
+MIN_SLIPPAGE_BPS             = 2.0

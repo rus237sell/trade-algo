@@ -1,13 +1,5 @@
 """
 quant-research: Statistical Arbitrage + Meta-Labeling Research Pipeline
-
-Entry point. Runs the full pipeline sequentially:
-  1. Data acquisition
-  2. Cointegration-based pair selection
-  3. Spread modeling and primary signal generation
-  4. Meta-labeling: feature extraction, walk-forward ML training, probability filtering
-  5. Vectorized backtest with transaction cost simulation
-  6. Performance metrics reporting
 """
 
 import warnings
@@ -18,7 +10,7 @@ import numpy as np
 
 import config
 from data.loader import fetch_prices, fetch_market_data, fetch_vix
-from research.pairs_finder import find_cointegrated_pairs
+from strategies.sector_pairs import scan_sectors_from_window, get_all_sector_symbols, SECTOR_UNIVERSE
 from research.spread_model import build_pair_model
 from research.meta_labeler import MetaLabeler, label_trades, build_features
 from backtest.engine import run_backtest
@@ -31,16 +23,18 @@ def main():
     print("quant-research | statistical arbitrage + meta-labeling")
     print("=" * 65)
 
-    # ------------------------------------------------------------------
-    # phase 1: data acquisition
-    # ------------------------------------------------------------------
+    # phase 1: data acquisition — download all sector symbols at once
     print("\n[1/5] fetching price data...")
 
-    prices = fetch_prices(config.UNIVERSE, config.START_DATE, config.END_DATE)
+    all_symbols = get_all_sector_symbols()
+    # include sector ETFs for residualization
+    etf_symbols = [info["etf"] for info in SECTOR_UNIVERSE.values()]
+    all_symbols_with_etfs = list(dict.fromkeys(all_symbols + etf_symbols))
+
+    prices = fetch_prices(all_symbols_with_etfs, config.START_DATE, config.END_DATE)
     market = fetch_market_data(config.START_DATE, config.END_DATE)
     vix    = fetch_vix(config.START_DATE, config.END_DATE)
 
-    # align all series to the same trading calendar
     common_idx = prices.index.intersection(market.index).intersection(vix.index)
     prices = prices.loc[common_idx]
     market = market.reindex(common_idx).ffill()
@@ -48,16 +42,14 @@ def main():
 
     print(f"    {len(prices)} trading days | {len(prices.columns)} symbols")
 
-    # ------------------------------------------------------------------
-    # phase 2: cointegration — find valid pairs on the formation period
-    # ------------------------------------------------------------------
-    print("\n[2/5] scanning for cointegrated pairs...")
+    # phase 2: sector-constrained pair selection on the formation window
+    print("\n[2/5] scanning for cointegrated sector pairs...")
 
-    formation_end = config.FORMATION_PERIOD_DAYS
-    accepted_pairs = find_cointegrated_pairs(prices, 0, formation_end)
+    formation_end = min(config.FORMATION_WINDOW, len(prices))
+    accepted_pairs = scan_sectors_from_window(prices, 0, formation_end)
 
     if not accepted_pairs:
-        print("    no cointegrated pairs found. try expanding the universe or relaxing thresholds.")
+        print("    no cointegrated sector pairs found.")
         return
 
     print(f"    {len(accepted_pairs)} pairs accepted:")
@@ -65,17 +57,18 @@ def main():
         print(f"      {p['y_sym']}/{p['x_sym']}  beta={p['beta']}  "
               f"half_life={p['half_life']}d  coint_p={p['coint_pvalue']}")
 
-    # ------------------------------------------------------------------
     # phase 3: spread modeling — rolling OLS, z-score, primary signals
-    # ------------------------------------------------------------------
     print("\n[3/5] building spread models and primary signals...")
 
-    pair_models     = {}   # pair_id -> {beta, spread, zscore, signals}
-    pair_definitions = []  # [(y_sym, x_sym), ...]
+    pair_models      = {}
+    pair_definitions = []
 
     for pair_id, pair in enumerate(accepted_pairs):
         y_sym = pair["y_sym"]
         x_sym = pair["x_sym"]
+
+        if y_sym not in prices.columns or x_sym not in prices.columns:
+            continue
 
         model = build_pair_model(prices, y_sym, x_sym)
         pair_models[pair_id] = model
@@ -84,9 +77,7 @@ def main():
         n_signals = (model["signals"] != 0).sum()
         print(f"    {y_sym}/{x_sym}: {n_signals} primary signals generated")
 
-    # ------------------------------------------------------------------
     # phase 4: meta-labeling — ML overlay on primary signals
-    # ------------------------------------------------------------------
     print("\n[4/5] running meta-labeling (walk-forward)...")
 
     signals_matrix = pd.DataFrame({
@@ -99,11 +90,11 @@ def main():
         for pid in pair_models
     }
 
-    # scale signals by ML probability for each pair
     for pair_id, pair in enumerate(accepted_pairs):
+        if pair_id not in pair_models:
+            continue
         model = pair_models[pair_id]
 
-        # generate binary trade labels from the primary signal history
         trade_labels_df = label_trades(
             signals = model["signals"],
             spread  = model["spread"],
@@ -120,7 +111,6 @@ def main():
               f"{len(trade_labels_df)} labeled trades | "
               f"base win rate = {trade_labels_df['label'].mean():.1%}")
 
-        # build contextual features at each trade entry
         features = build_features(
             entry_dates = trade_labels_df.index,
             zscore      = model["zscore"],
@@ -131,23 +121,17 @@ def main():
         )
 
         labels = trade_labels_df["label"]
-
-        # walk-forward train/predict
         ml = MetaLabeler()
         probabilities = ml.walk_forward_predict(features, labels)
 
         if len(ml.oos_auc) > 0:
-            mean_auc = np.mean(ml.oos_auc)
-            print(f"    mean out-of-sample AUC: {mean_auc:.3f}")
+            print(f"    mean OOS AUC: {np.mean(ml.oos_auc):.3f}")
 
-        # replace raw signals with ML-filtered, probability-scaled signals
-        primary = model["signals"]
+        primary  = model["signals"]
         filtered = ml.apply_filter_and_size(primary, probabilities)
         signals_matrix[pair_id] = filtered
 
-    # ------------------------------------------------------------------
     # phase 5: backtest
-    # ------------------------------------------------------------------
     print("\n[5/5] running vectorized backtest...")
 
     market_returns = np.log(market / market.shift(1)).dropna()
@@ -159,9 +143,6 @@ def main():
         pair_definitions = pair_definitions,
     )
 
-    # ------------------------------------------------------------------
-    # results
-    # ------------------------------------------------------------------
     perf = summarize(
         returns        = daily_returns.dropna(),
         equity_curve   = equity_curve.dropna(),
