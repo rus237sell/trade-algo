@@ -224,6 +224,45 @@ def composite_score(
     return (w_dfa * w_adx * w_entry).fillna(0.0)
 
 
+def factor_residuals(
+    returns:        pd.Series,
+    factor_returns: pd.DataFrame,
+    window:         int = 60,
+) -> pd.Series:
+    """
+    Remove common factor exposure from a return series via rolling OLS.
+
+    For each day i, regress the past `window` days of returns on the factor
+    matrix (e.g. Fama-French MKT-RF, SMB, HML or sector ETF return).
+    The residual at day i is the idiosyncratic component.
+
+    Apply to the spread return series before DFA so the DFA exponent measures
+    genuine anti-persistence rather than market-wide drift.
+    """
+    import statsmodels.api as sm
+
+    aligned_factors = factor_returns.reindex(returns.index).ffill().dropna()
+    common_idx      = returns.index.intersection(aligned_factors.index)
+    r               = returns.loc[common_idx]
+    f               = aligned_factors.loc[common_idx]
+
+    residuals = pd.Series(np.nan, index=r.index)
+
+    for i in range(window, len(r)):
+        y     = r.iloc[i - window: i]
+        X     = sm.add_constant(f.iloc[i - window: i])
+        try:
+            model = sm.OLS(y, X).fit()
+            # out-of-sample residual for day i using the rolling model
+            X_now = sm.add_constant(f.iloc[i: i + 1], has_constant='add')
+            pred  = model.predict(X_now).values[0]
+            residuals.iloc[i] = r.iloc[i] - pred
+        except Exception:
+            residuals.iloc[i] = r.iloc[i]
+
+    return residuals.dropna()
+
+
 def variance_ratio_filter(
     spread_returns: pd.Series,
     lags:           list = None,

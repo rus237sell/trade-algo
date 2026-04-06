@@ -9,12 +9,12 @@ import pandas as pd
 import numpy as np
 
 import config
-from data.loader import fetch_prices, fetch_market_data, fetch_vix
+from data.loader import fetch_prices, fetch_market_data, fetch_vix, fetch_ff_factors
 from strategies.sector_pairs import scan_sectors_from_window, get_all_sector_symbols, SECTOR_UNIVERSE
 from research.spread_model import build_pair_model
 from research.meta_labeler import MetaLabeler, label_trades, build_features
 from research.pairs_finder import rolling_adf_health
-from signals.regime_filter import rolling_dfa, composite_score, threshold_gate, compute_adx_from_close, variance_ratio_filter
+from signals.regime_filter import rolling_dfa, composite_score, threshold_gate, compute_adx_from_close, variance_ratio_filter, factor_residuals
 from signals.markov_regime import rolling_regime_fit, regime_allocation
 from strategies.momentum import MomentumStrategy
 from backtest.engine import run_backtest
@@ -45,6 +45,13 @@ def main():
     vix    = vix.reindex(common_idx).ffill()
 
     print(f"    {len(prices)} trading days | {len(prices.columns)} symbols")
+
+    # try to load Fama-French factors for spread residualization before DFA
+    ff_factors = fetch_ff_factors(config.START_DATE, config.END_DATE)
+    if ff_factors is not None:
+        print(f"    Fama-French factors loaded: {list(ff_factors.columns)}")
+    else:
+        print(f"    Fama-French unavailable — using raw spread returns for DFA")
 
     # phase 2: rolling sector pair selection — rescan every RESCAN_INTERVAL days
     print("\n[2/5] scanning for cointegrated sector pairs (rolling)...")
@@ -106,6 +113,14 @@ def main():
 
         # run DFA on the spread (not raw stock prices) — spread is what mean-reverts
         spread_returns = model["spread"].pct_change().dropna()
+
+        # factor-residualize before DFA: removes market/sector factor persistence
+        if ff_factors is not None:
+            try:
+                spread_returns = factor_residuals(spread_returns, ff_factors[["Mkt-RF", "SMB", "HML"]])
+            except Exception:
+                pass  # fall back to raw spread returns if residualization fails
+
         # reconstruct a price-like series so rolling_dfa can compute log-returns
         spread_price = (1 + spread_returns).cumprod() * 100
 

@@ -73,6 +73,28 @@ def compute_log_returns(prices: pd.DataFrame) -> pd.DataFrame:
     return np.log(prices / prices.shift(1)).dropna()
 
 
+def fetch_ff_factors(start: str, end: str) -> pd.DataFrame:
+    """
+    Downloads Fama-French 3-factor daily data (MKT-RF, SMB, HML) from
+    Kenneth French's data library via pandas_datareader.
+
+    Returns a DataFrame with columns [MKT-RF, SMB, HML, RF] indexed by date,
+    values in decimal (already divided by 100).
+
+    Falls back to None if pandas_datareader is not installed or the download fails.
+    """
+    try:
+        import pandas_datareader.data as web
+        ds = web.DataReader('F-F_Research_Data_Factors_daily', 'famafrench',
+                            start=start, end=end)
+        # the first table (index 0) is the daily factor data
+        ff = ds[0] / 100.0
+        ff.index = pd.to_datetime(ff.index.astype(str))
+        return ff
+    except Exception:
+        return None
+
+
 def align_series(series_dict: dict) -> dict:
     """
     Aligns all DataFrames/Series in a dict to their common date index.
