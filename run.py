@@ -15,6 +15,7 @@ from research.spread_model import build_pair_model
 from research.meta_labeler import MetaLabeler, label_trades, build_features
 from research.pairs_finder import rolling_adf_health
 from signals.regime_filter import rolling_dfa, composite_score, threshold_gate, compute_adx_from_close
+from signals.markov_regime import rolling_regime_fit, regime_allocation
 from backtest.engine import run_backtest
 from backtest.metrics import summarize
 
@@ -125,6 +126,40 @@ def main():
         n_raw    = (model["signals"] != 0).sum()
         n_gated  = (gated_signals != 0).sum()
         print(f"    {y_sym}/{x_sym}: {n_raw} raw → {n_gated} gated signals")
+
+    # phase 3.5: Markov regime — fit on equal-weighted portfolio return, scale MR signals
+    print("\n[3.5/5] fitting Markov regime model...")
+
+    if pair_models:
+        portfolio_spread_returns = pd.DataFrame({
+            pid: pair_models[pid]["spread"].pct_change()
+            for pid in pair_models
+        }).dropna()
+
+        if len(portfolio_spread_returns) >= config.MARKOV_WINDOW:
+            equal_weighted = portfolio_spread_returns.mean(axis=1)
+            try:
+                regime_probs = rolling_regime_fit(
+                    equal_weighted,
+                    estimation_days = config.MARKOV_WINDOW,
+                    refit_every     = config.MARKOV_REFIT_INTERVAL,
+                    prob_threshold  = config.MARKOV_SWITCH_THRESHOLD,
+                )
+                alloc = regime_allocation(
+                    regime_probs,
+                    mom_weight_trending = config.MARKOV_TRENDING_MOM_WEIGHT,
+                )
+                # use filtered (not smoothed) probabilities, 1-day lag already applied in regime_allocation
+                mr_weight = alloc["mean_reversion_weight"].reindex(prices.index).ffill().fillna(1.0)
+                print(f"    mean MR allocation weight: {mr_weight.mean():.2f}")
+
+                # scale all pair signals by Markov mean-reversion weight
+                for pid in pair_models:
+                    pair_models[pid]["signals"] = pair_models[pid]["signals"] * mr_weight
+            except Exception as e:
+                print(f"    Markov fit failed: {e} — using full MR allocation")
+        else:
+            print(f"    insufficient history for Markov ({len(portfolio_spread_returns)} days < {config.MARKOV_WINDOW})")
 
     # phase 4: meta-labeling — pool labeled trades across all pairs then train
     print("\n[4/5] running meta-labeling (walk-forward, pooled)...")
