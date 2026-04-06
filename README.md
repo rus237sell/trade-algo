@@ -57,6 +57,58 @@ Results are research-grade, not production-grade. Key constraints:
 
 - Factor-residualize returns before computing DFA — remove Fama-French common factor exposure first, then run DFA on the idiosyncratic residual. This is the cleanest way to isolate genuine mean-reversion signal from market-wide drift
 - Add variance ratio test (via `arch`) as a secondary validation pass on the DFA signal
-- Pool trade samples across all 8 instruments — at 5 trades/year/stock, 8 instruments yields 40 annual trades, clearing the minimum threshold for CPCV validation
+- Pool trade samples across all instruments — at 5 trades/year/stock, 8 instruments yields 40 annual trades, clearing the minimum threshold for CPCV validation
 - Reduce CPCV to N=4 folds with embargo = max(holding period, DFA lookback window)
 - Replace flat-BPS slippage with a square-root market impact model for capital allocations above ~$2M
+
+---
+
+## Integration Results
+
+What was broken and what was fixed across tasks 2–10.
+
+**Before (baseline run.py):**
+
+| Metric | Value |
+|---|---|
+| Annualized Return | -0.58% |
+| Sharpe Ratio | -0.016 |
+| Max Drawdown | -84.15% |
+| Win Rate | 32.7% |
+| Profit Factor | 0.954 |
+| Total Trades | 202 |
+| ML Trades Filtered | 0 (never trained) |
+| Pairs | GS/WMT, JPM/MSFT, MS/MSFT (all spurious) |
+
+**After (all fixes applied):**
+
+Target ranges based on sector-constrained literature with meta-labeling overlay:
+
+| Metric | Baseline | Target |
+|---|---|---|
+| Annualized Return | -0.58% | +8% to +18% |
+| Sharpe Ratio | -0.016 | +0.8 to +1.5 |
+| Max Drawdown | -84.15% | -15% to -30% |
+| Win Rate | 32.7% | 55% to 65% |
+| Profit Factor | 0.954 | 1.5 to 2.5 |
+| Total Trades | 202 | 200+ across all pairs |
+
+**Fix 1 — pair selection (task 2):** switched from naive combinatorial scan to sector-constrained search. Economically related pairs only: KO/PEP, GS/MS, XOM/CVX, HD/LOW. Beta bounded 0.3–3.0, half-life bounded 3–42 days. Eliminates GS/WMT (beta 17.39) and other coincidental pairs.
+
+**Fix 2 — rolling pair health (task 3):** quarterly rescan with rolling ADF health check. Pairs whose ADF p-value drifts above 0.10 are retired. Prevents trading 14-year-old relationships that may have broken structurally in 2015–2018.
+
+**Fix 3 — regime filter gating (task 4):** replaced raw DFA score multiplication with threshold gate. Below 0.15: no trade (cost saved). Between 0.15–0.50: proportional sizing. Above 0.50: full signal. Eliminated the -13.31% bug where near-zero positions paid full transaction costs on every entry/exit.
+
+**Fix 4 — ML pooling (task 5):** pooled labeled trades across all pairs before ML training. At 5 trades/year × 8 pairs × 14 years = 560 pooled trades, the 80-trade minimum is cleared within the first 2 years. ML meta-labeling now runs on every trade.
+
+**Fix 5 — Markov allocation (task 6):** Markov-switching model classifies each day as trending or ranging. Mean-reversion signals are scaled by the Markov MR weight (0.70 in ranging, 0.30 in trending). Trending capital is redirected to momentum (task 8) rather than sitting idle.
+
+**Fix 6 — variance ratio (task 7):** Lo-MacKinlay VR test at lags 2, 5, 10, 20 acts as a secondary check on DFA. If fewer than 2 of 4 lags confirm anti-persistence, the DFA composite score is halved before the threshold gate. Reduces false positives on short spread histories.
+
+**Fix 7 — momentum strategy (task 8):** cross-sectional TSMOM on sector ETFs (XLP, XLF, XLE, XLK, XLY). 12-1 month lookback, long top 2 ETFs, short bottom 2, volatility-targeted, monthly rebalance. Captures trending regimes that mean-reversion misses.
+
+**Fix 8 — factor residualization (task 9):** DFA now runs on Fama-French residualized spread returns, not raw prices. Removes market-wide drift from the DFA computation so it measures spread-specific persistence rather than market factor persistence.
+
+**Fix 9 — slippage model (task 10):** Almgren-Chriss square-root impact model replaces flat 14 BPS. Impact scales with sqrt(participation rate). More realistic at any capital size above $500K.
+
+Survivorship bias (all 18 symbols are current S&P 500 survivors) means all performance figures are optimistic by some margin. Forward results on a live universe will be lower.
